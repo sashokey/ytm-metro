@@ -2,20 +2,20 @@ Tampermonkey userscript for `music.youtube.com`. Buffers audio for the current t
 
 ## Installation
 
-1. In a browser with Tampermonkey, open [the userscript](https://raw.githubusercontent.com/sashokey/ytm-metro/master/ytm-metro.user.js) and install it. If the browser displays the source, paste it into **Tampermonkey → Dashboard → Create a new script** and save.
+1. Install `ytm-metro.user.js` with Tampermonkey, or paste its contents into **Tampermonkey → Dashboard → Create a new script** and save.
 2. Reload `music.youtube.com` and start playback.
-
-Updates are fetched from this repository through Tampermonkey. Keep automatic update checks enabled. If you previously installed version 1.0.0 by copying the code, reinstall once using the link above to configure future updates.
 
 ## Usage
 
-Wait for **Metro 2/2** before losing connectivity: both upcoming audio files are fully buffered. Use the site's playback controls. The reserve replenishes during playback when connectivity is available. Tap **Metro** to retry incomplete downloads.
+Use the site's normal playback controls. The script adds no buttons, indicators, styles, or other UI.
+
+Keep connectivity available while the upcoming audio files are downloaded. Fully buffered tracks remain available after the connection is lost. The reserve replenishes during playback when connectivity is available; failed downloads are eligible for another attempt when the browser reports that the connection has returned.
+
+Repeat all includes tracks at the beginning of the queue. Already buffered tracks are reused, including repeated entries in the queue.
 
 ## Limits
 
 - Audio only; live streams and files larger than 16 MiB are not buffered.
+- The two upcoming tracks must finish downloading before connectivity is lost. There is no visible readiness indicator.
 - Reloading, closing, or discarding the tab clears the buffer. Uncached tracks require connectivity.
-- Native ads can delay offline transitions; delays of approximately 20 seconds were observed. Browser background-playback restrictions still apply.
-- Uses internal YouTube APIs and the UMP media format; site changes may require updates.
-
-Tested on the live mobile site in Chromium with Android emulation and networking disabled: two automatic track transitions, seeking, Play/Pause, and reserve replenishment after reconnection. Physical phones and installation through Tampermonkey have not been tested.
+- Native ads can delay offline transitions. Browser background-playback restrictions still apply.

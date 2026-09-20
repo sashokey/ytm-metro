@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Music Metro Buffer
 // @namespace    local.ytm.metro
-// @version      1.0.1
+// @version      1.0.3
 // @description  Keep the current song and two upcoming songs in memory for network gaps.
 // @homepageURL  https://github.com/sashokey/ytm-metro
 // @updateURL    https://raw.githubusercontent.com/sashokey/ytm-metro/master/ytm-metro.user.js
@@ -26,16 +26,13 @@
     const decoder = new TextDecoder();
     const listeners = new AbortController();
     let wanted = [];
-    let upcoming = [];
     let controller;
     let unsubscribe;
     let originalLoad;
-    let button;
     let busy;
     let timer;
     let stopped = false;
     let queueKey = '';
-    let localHits = 0;
 
     const varint = number => {
         const bytes = [];
@@ -142,7 +139,7 @@
                         if (type !== 20) continue;
                         const fields = readProto(payload);
                         const id = decoder.decode(fields.get(2));
-                        if (!wanted.includes(id) || !protection || fields.get(7)) return;
+                        if (stopped || !wanted.includes(id) || !protection || fields.get(7)) return;
                         const entry = entryFor(id);
                         if (!entry.url) {
                             entry.url = url;
@@ -187,7 +184,6 @@
             ]);
             type = 'application/vnd.yt-ump';
         }
-        localHits++;
         return Promise.resolve(new Response(body, {status: 200, headers: {'Content-Type': type}}));
     }
 
@@ -206,9 +202,10 @@
         if (url) request.then(response => inspectMedia(response, url)).catch(() => {});
         else if (text.includes('/youtubei/v1/player')) {
             return request.then(async response => {
-                if (!response.ok) return response;
+                if (stopped || !response.ok) return response;
                 try {
                     const data = await response.clone().json();
+                    if (stopped) return response;
                     const id = data.videoDetails?.videoId;
                     const queued = wanted.includes(id) || document.getElementById('queue')?.getState?.().queue?.items?.some(item => renderer(item)?.videoId === id);
                     if (!queued) return response;
@@ -229,19 +226,6 @@
         return request;
     }
 
-    function render() {
-        if (!button) return;
-        const ready = upcoming.filter(id => entries.get(id)?.blob).length;
-        const text = `Metro ${ready}/${upcoming.length}`;
-        const color = ready === upcoming.length && ready ? 'rgb(143, 218, 155)' : 'rgb(238, 238, 238)';
-        if (button.textContent !== text) button.textContent = text;
-        if (button.style.color !== color) button.style.color = color;
-        const total = [...entries.values()].reduce((sum, entry) => sum + (entry.blob?.size || 0), 0);
-        const failed = [...entries.values()].some(entry => entry.error && !entry.blob);
-        const title = `${navigator.onLine ? 'Online' : 'Offline'} · ${(total / 1048576).toFixed(1)} MB in memory\n${busy ? 'Buffering audio' : failed ? 'Some audio could not be buffered' : ready ? 'Upcoming audio ready' : 'Play a song to prepare the queue'}\nTap to retry incomplete downloads. Cache is cleared when this tab closes.`;
-        if (button.title !== title) button.title = title;
-    }
-
     function schedule() {
         if (!stopped && !timer) timer = setTimeout(() => { timer = 0; update(); }, 200);
     }
@@ -250,7 +234,6 @@
         const abort = new AbortController();
         busy = {entry, abort};
         entry.attempted = true;
-        render();
         const timeout = setTimeout(() => abort.abort(), 90000);
         try {
             const url = new URL(entry.url);
@@ -262,12 +245,9 @@
             const blob = await response.blob();
             if (blob.size !== entry.size) throw Error('Incomplete audio');
             if (entries.get(entry.id) === entry && wanted.includes(entry.id)) entry.blob = blob;
-        } catch (error) {
-            entry.error = error.name === 'AbortError' ? 'Interrupted' : 'Download unavailable';
-        } finally {
+        } catch {} finally {
             clearTimeout(timeout);
             busy = null;
-            render();
             schedule();
         }
     }
@@ -292,30 +272,25 @@
                 if (entry?.blob && entry.response && !vars.autonav) vars = {...vars, audio_only: '1', raw_player_response: structuredClone(entry.response)};
                 return originalLoad.call(this, vars, ...rest);
             };
-            button = document.createElement('button');
-            button.type = 'button';
-            button.setAttribute('aria-label', 'Metro audio buffer status');
-            button.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:2200;background:#202020e8;color:#eee;border:1px solid #555;border-radius:12px;padding:4px 9px;font:11px system-ui;cursor:pointer;';
-            button.addEventListener('click', retry, {signal: listeners.signal});
-            document.body.append(button);
         }
         const state = controller.store.getState();
         const queue = state.queue;
-        if (!queue?.items?.length) return;
-        const index = queue.selectedItemIndex;
-        const items = queue.items.slice(index, index + ahead + 1).map(renderer).filter(Boolean);
+        const index = queue?.selectedItemIndex;
+        const queued = index >= 0 ? queue.items.slice(index, index + ahead + 1) : [];
+        if (queue?.repeatMode === 'ALL' && index > 0 && queued.length < ahead + 1) queued.push(...queue.items.slice(0, Math.min(index, ahead + 1 - queued.length)));
+        const items = queued.map(renderer).filter(Boolean);
         const nextWanted = items.map(item => item.videoId);
         const key = nextWanted.join('|');
         if (key !== queueKey) {
             queueKey = key;
             wanted = nextWanted;
-            upcoming = wanted.slice(1);
             if (busy && !wanted.includes(busy.entry.id)) busy.abort.abort();
             for (const [id, entry] of entries) if (!wanted.includes(id)) {
                 if (entry.url) resources.delete(resourceKey(entry.url));
                 entries.delete(id);
             }
         }
+        if (!wanted.length) return;
         if (!entries.get(wanted[0])?.response) {
             const current = controller.playerApi.getPlayerResponse?.();
             if (current?.videoDetails?.videoId === wanted[0]) entryFor(wanted[0]).response = current;
@@ -326,7 +301,7 @@
                 const entry = entryFor(item.videoId);
                 const endpoint = item.navigationEndpoint;
                 const watch = endpoint?.watchEndpoint;
-                if (entry.preloaded || !watch) continue;
+                if (entry.id === wanted[0] || entry.preloaded || entry.blob && entry.response || !watch) continue;
                 entry.preloaded = true;
                 const vars = {
                     video_id: watch.videoId, start: 0, player_params: watch.playerParams,
@@ -336,20 +311,19 @@
                     csi_timer: controller.timerName || '', list: watch.playlistId, itct: endpoint.clickTrackingParams,
                     pause_at_start: false, autoplay: true, autonav: true, audio_only: '1'
                 };
-                try { controller.playerApi.preloadVideoByPlayerVars(vars); } catch { entry.error = 'Preload unavailable'; }
+                try { controller.playerApi.preloadVideoByPlayerVars(vars); } catch {}
             }
             if (!busy) {
-                const entry = [...upcoming, wanted[0]].map(id => entries.get(id)).find(entry => entry?.url && !entry.blob && !entry.attempted);
+                const entry = [...wanted.slice(1), wanted[0]].map(id => entries.get(id)).find(entry => entry?.url && !entry.blob && !entry.attempted);
                 if (entry) void download(entry);
             }
         }
-        render();
     }
 
     function retry() {
         for (const entry of entries.values()) if (!entry.blob) {
             entry.attempted = false;
-            entry.error = null;
+            if (!entry.url) entry.preloaded = false;
         }
         schedule();
     }
@@ -362,21 +336,17 @@
         listeners.abort();
         if (window.fetch === interceptedFetch) window.fetch = originalFetch;
         if (controller && originalLoad) controller.playerApi.loadVideoByPlayerVars = originalLoad;
-        button?.remove();
+        wanted = [];
         entries.clear();
         resources.clear();
         delete window.__ytmMetro;
     }
 
     window.fetch = interceptedFetch;
-    window.__ytmMetro = {
-        stop,
-        status: () => ({wanted: [...wanted], ready: [...entries.values()].filter(entry => entry.blob).map(entry => entry.id), localHits, downloading: busy?.entry.id || null, entries: [...entries.values()].map(entry => ({id: entry.id, source: !!entry.url, metadata: !!entry.response, bytes: entry.blob?.size || 0, error: entry.error || null}))})
-    };
+    window.__ytmMetro = stop;
     for (const event of ['yt-navigate-finish', 'yt-player-updated', 'DOMContentLoaded']) document.addEventListener(event, schedule, {signal: listeners.signal});
     document.addEventListener('playing', schedule, {capture: true, signal: listeners.signal});
     window.addEventListener('online', retry, {signal: listeners.signal});
-    window.addEventListener('offline', render, {signal: listeners.signal});
     window.addEventListener('pagehide', event => { if (!event.persisted) stop(); }, {signal: listeners.signal});
     schedule();
 })();
