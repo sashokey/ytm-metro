@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Music Metro Buffer
 // @namespace    local.ytm.metro
-// @version      1.0.3
+// @version      1.0.4
 // @description  Keep the current song and two upcoming songs in memory for network gaps.
 // @homepageURL  https://github.com/sashokey/ytm-metro
 // @updateURL    https://raw.githubusercontent.com/sashokey/ytm-metro/master/ytm-metro.user.js
@@ -32,6 +32,7 @@
     let busy;
     let timer;
     let stopped = false;
+    let restricted = false;
     let queueKey = '';
 
     const varint = number => {
@@ -110,12 +111,29 @@
 
     const resourceKey = url => ['id', 'itag', 'lmt', 'clen', 'xtags'].map(key => url.searchParams.get(key) || '').join('|');
     const entryFor = id => {
-        if (!entries.has(id)) entries.set(id, {id, attempted: false, preloaded: false});
+        if (!entries.has(id)) {
+            entries.set(id, {id, attempted: false, preloaded: false});
+            prune();
+        }
         return entries.get(id);
     };
 
+    function prune() {
+        for (const [id, entry] of entries) if (!wanted.includes(id) && (!entry.blob || entries.size > ahead + 2)) {
+            if (entry.url) resources.delete(resourceKey(entry.url));
+            entries.delete(id);
+        }
+    }
+
+    function checkRestriction(response) {
+        if (response.status !== 403 && response.status !== 429) return false;
+        restricted = true;
+        busy?.abort.abort();
+        return true;
+    }
+
     async function inspectMedia(response, url) {
-        if (!response.ok || !response.headers.get('Content-Type')?.includes('yt-ump')) return;
+        if (checkRestriction(response) || restricted || !response.ok || !response.headers.get('Content-Type')?.includes('yt-ump')) return;
         const reader = response.clone().body.getReader();
         let data = new Uint8Array();
         let protection;
@@ -141,7 +159,14 @@
                         const id = decoder.decode(fields.get(2));
                         if (stopped || !wanted.includes(id) || !protection || fields.get(7)) return;
                         const entry = entryFor(id);
-                        if (!entry.url) {
+                        if (!entry.url || resourceKey(entry.url) !== resourceKey(url)) {
+                            if (entry.url) {
+                                resources.delete(resourceKey(entry.url));
+                                if (entry.itag !== fields.get(3) || entry.lmt !== fields.get(4) || entry.size !== Number(url.searchParams.get('clen')) || entry.xtags?.toString() !== fields.get(5)?.toString()) {
+                                    entry.blob = undefined;
+                                    entry.attempted = false;
+                                }
+                            }
                             entry.url = url;
                             entry.protection = protection;
                             entry.itag = fields.get(3);
@@ -202,7 +227,7 @@
         if (url) request.then(response => inspectMedia(response, url)).catch(() => {});
         else if (text.includes('/youtubei/v1/player')) {
             return request.then(async response => {
-                if (stopped || !response.ok) return response;
+                if (checkRestriction(response) || stopped || !response.ok) return response;
                 try {
                     const data = await response.clone().json();
                     if (stopped) return response;
@@ -241,6 +266,7 @@
             url.searchParams.delete('ump');
             url.searchParams.delete('srfvp');
             const response = await originalFetch(url.href, {credentials: 'omit', signal: abort.signal});
+            if (checkRestriction(response)) return;
             if (!response.ok || !response.headers.get('Content-Type')?.startsWith('audio/')) throw Error('Audio unavailable');
             const blob = await response.blob();
             if (blob.size !== entry.size) throw Error('Incomplete audio');
@@ -269,7 +295,7 @@
             originalLoad = controller.playerApi.loadVideoByPlayerVars;
             controller.playerApi.loadVideoByPlayerVars = function(vars, ...rest) {
                 const entry = entries.get(vars.video_id || vars.videoId);
-                if (entry?.blob && entry.response && !vars.autonav) vars = {...vars, audio_only: '1', raw_player_response: structuredClone(entry.response)};
+                if (!navigator.onLine && entry?.blob && entry.response && !vars.autonav) vars = {...vars, audio_only: '1', raw_player_response: structuredClone(entry.response)};
                 return originalLoad.call(this, vars, ...rest);
             };
         }
@@ -285,17 +311,21 @@
             queueKey = key;
             wanted = nextWanted;
             if (busy && !wanted.includes(busy.entry.id)) busy.abort.abort();
-            for (const [id, entry] of entries) if (!wanted.includes(id)) {
-                if (entry.url) resources.delete(resourceKey(entry.url));
-                entries.delete(id);
+            for (const id of wanted) {
+                const entry = entries.get(id);
+                if (entry) {
+                    entries.delete(id);
+                    entries.set(id, entry);
+                }
             }
+            prune();
         }
         if (!wanted.length) return;
         if (!entries.get(wanted[0])?.response) {
             const current = controller.playerApi.getPlayerResponse?.();
             if (current?.videoDetails?.videoId === wanted[0]) entryFor(wanted[0]).response = current;
         }
-        if (navigator.onLine && !state.player.adPlaying && (state.player.isPlaying || controller.playerApi.getPlayerState?.() === 1)) {
+        if (!restricted && navigator.onLine && !state.player.adPlaying && (state.player.isPlaying || controller.playerApi.getPlayerState?.() === 1)) {
             const quality = window.ytcfg?.get('AUDIO_QUALITY');
             for (const item of items.slice(1)) {
                 const entry = entryFor(item.videoId);
@@ -321,6 +351,7 @@
     }
 
     function retry() {
+        if (restricted) return;
         for (const entry of entries.values()) if (!entry.blob) {
             entry.attempted = false;
             if (!entry.url) entry.preloaded = false;
